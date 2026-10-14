@@ -1,0 +1,139 @@
+
+name: CI/CD Pipeline with SAST & SCA
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Critical errors
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Style report
+        run: flake8 . --count --statistics --exit-zero
+
+  security-scan:
+    name: Security Scan (SAST + SCA)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Bandit
+        run: pip install "bandit[toml]"
+
+      - name: Run Bandit
+        run: bandit -c pyproject.toml -r . -f screen --exit-zero
+
+      - name: Generate JSON report
+        run: bandit -c pyproject.toml -r . -f json -o bandit-results.json --exit-zero
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: bandit-report
+          path: bandit-results.json
+          retention-days: 14
+
+      - name: Bandit Quality Gate
+        id: bandit-gate
+        continue-on-error: true
+        run: |
+          COUNT=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-results.json)
+          echo "HIGH findings: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Run Trivy
+        id: trivy-gate
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Enforce security gates
+        if: always()
+        env:
+          BANDIT_RESULT: ${{ steps.bandit-gate.outcome }}
+          TRIVY_RESULT: ${{ steps.trivy-gate.outcome }}
+        run: |
+          if [ "$BANDIT_RESULT" != "success" ] || [ "$TRIVY_RESULT" != "success" ]; then
+            exit 1
+          fi
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install Flask==3.1.3 pytest
+
+      - name: Run tests
+        run: pytest -v
+
+  build:
+    name: Build Artifact
+    runs-on: ubuntu-latest
+    needs: [lint, security-scan, test]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          tar --exclude=./dist --exclude=./.git -czf dist/app.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: application-build
+          path: dist/app.tar.gz
